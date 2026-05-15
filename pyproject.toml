@@ -9,6 +9,11 @@ dependencies = [
     "zxing-cpp>=3.0",
 ]
 
+[project.optional-dependencies]
+pyzbar = [
+    "pyzbar>=0.1.9",
+]
+
 [project.scripts]
 zxing-cpp-sr = "zxing_cpp_sr.decoder:main"
 

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
+
 import cv2
 import numpy as np
 import pytest
 
+import zxing_cpp_sr.decoder as decoder_mod
 from zxing_cpp_sr import DecodeConfig, decode_image
 
 pytest.importorskip("zxingcpp")
@@ -148,6 +152,103 @@ def test_wechat_fallback_runs_after_zxing_miss(monkeypatch: pytest.MonkeyPatch) 
     assert calls == [(64, 64, 3)]
 
 
+def test_wechat_rgb_input_is_converted_to_bgr(monkeypatch: pytest.MonkeyPatch) -> None:
+    image_rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+    image_rgb[0, 0] = [10, 20, 30]
+    first_pixels: list[tuple[int, int, int]] = []
+
+    class FakeWechat:
+        def detectAndDecode(self, image: np.ndarray) -> tuple[list[str], None]:
+            first_pixels.append(tuple(int(value) for value in image[0, 0]))
+            return ["rgb-hit"], None
+
+    monkeypatch.setattr(cv2, "wechat_qrcode_WeChatQRCode", FakeWechat, raising=False)
+
+    result = decode_image(
+        image_rgb,
+        DecodeConfig(
+            backends=("wechat",),
+            input_color="rgb",
+            scale_factors=(),
+            enable_clahe=False,
+            enable_sharpen=False,
+        ),
+    )
+
+    assert result.success
+    assert result.payload == "rgb-hit"
+    assert first_pixels == [(30, 20, 10)]
+
+
+def test_opencv_qr_backend_alias_uses_lazy_cascade(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    inits = 0
+
+    class FakeOpenCVQR:
+        def detectAndDecode(self, image: np.ndarray) -> tuple[str, np.ndarray, None]:
+            return (
+                "opencv-hit",
+                np.array([[[1.0, 2.0], [5.0, 2.0], [5.0, 6.0], [1.0, 6.0]]], dtype=np.float32),
+                None,
+            )
+
+    def make_detector() -> FakeOpenCVQR:
+        nonlocal inits
+        inits += 1
+        return FakeOpenCVQR()
+
+    monkeypatch.setattr(cv2, "QRCodeDetector", make_detector)
+
+    result = decode_image(
+        image,
+        DecodeConfig(
+            backends=("opencv",),
+            scale_factors=(),
+            enable_clahe=False,
+            enable_sharpen=False,
+        ),
+    )
+
+    assert result.success
+    assert result.payload == "opencv-hit"
+    assert result.barcode is not None
+    assert result.barcode.backend == "opencv_qr"
+    assert result.barcode.position == ((1.0, 2.0), (5.0, 2.0), (5.0, 6.0), (1.0, 6.0))
+    assert inits == 1
+
+
+def test_pyzbar_alias_records_payload_and_polygon(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    item = SimpleNamespace(
+        data=b"pyzbar-hit",
+        type="QRCODE",
+        polygon=[
+            SimpleNamespace(x=2, y=4),
+            SimpleNamespace(x=6, y=4),
+            SimpleNamespace(x=6, y=8),
+            SimpleNamespace(x=2, y=8),
+        ],
+    )
+
+    monkeypatch.setattr(decoder_mod, "_get_pyzbar_decode", lambda _state, _notes: lambda _image: [item])
+
+    result = decode_image(
+        image,
+        DecodeConfig(
+            backends=("zbar",),
+            scale_factors=(),
+            enable_clahe=False,
+            enable_sharpen=False,
+        ),
+    )
+
+    assert result.success
+    assert result.payload == "pyzbar-hit"
+    assert result.barcode is not None
+    assert result.barcode.backend == "pyzbar"
+    assert result.barcode.position == ((2.0, 4.0), (6.0, 4.0), (6.0, 8.0), (2.0, 8.0))
+
+
 def test_wechat_unavailable_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     image = np.zeros((64, 64, 3), dtype=np.uint8)
     monkeypatch.setattr(cv2, "wechat_qrcode_WeChatQRCode", None, raising=False)
@@ -165,3 +266,31 @@ def test_wechat_unavailable_is_reported(monkeypatch: pytest.MonkeyPatch) -> None
     assert not result.success
     assert result.attempts == ()
     assert any("WeChat QR fallback unavailable" in note for note in result.notes)
+
+
+def test_wechat_init_failure_is_reported_and_logged(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    def fail_init() -> None:
+        raise RuntimeError("missing wechat model files")
+
+    monkeypatch.setattr(cv2, "wechat_qrcode_WeChatQRCode", fail_init, raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="zxing_cpp_sr.decoder"):
+        result = decode_image(
+            image,
+            DecodeConfig(
+                backends=("wechat",),
+                scale_factors=(),
+                enable_clahe=False,
+                enable_sharpen=False,
+            ),
+        )
+
+    assert not result.success
+    assert result.attempts == ()
+    assert any("missing wechat model files" in note for note in result.notes)
+    assert "OpenCV WeChat QR decoder failed to initialize" in caplog.text

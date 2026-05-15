@@ -35,7 +35,9 @@ All measured configs used `backends=("zxing",)`, `formats="qr"`, and
 `return_errors=True` to isolate the classical upscale/SR retry cost. The current
 package default is a cascade, `backends=("zxing", "wechat")`: WeChat's
 OpenCV-contrib QR detector/SR backend is initialized lazily only after a ZXing
-miss on the current variant.
+miss on the current variant. The standalone package also ports the optional
+main-repo fallbacks `pyzbar` and `opencv_qr`; they were not included in these
+timings.
 
 ## Real Lenta Sets
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from collections.abc import Iterator
@@ -17,7 +18,10 @@ import numpy as np
 SRModel = Callable[[np.ndarray, float], np.ndarray]
 ZXING_BACKEND = "zxing-cpp"
 WECHAT_BACKEND = "wechat_qrcode"
-_WECHAT_UNAVAILABLE = object()
+PYZBAR_BACKEND = "pyzbar"
+OPENCV_QR_BACKEND = "opencv_qr"
+_UNAVAILABLE = object()
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -113,6 +117,7 @@ class DecodeConfig:
     """Controls decoder backends and preprocessing retries."""
 
     backends: tuple[str, ...] = ("zxing", "wechat")
+    input_color: str = "bgr"  # bgr for cv2.imread/CLI, rgb for main-pipeline crops
     formats: str = "qr"  # qr, retail, all
     scale_factors: tuple[float, ...] = (2.0, 3.0, 4.0)
     interpolations: tuple[str, ...] = ("cubic", "lanczos")
@@ -149,7 +154,7 @@ def decode_image(
     """Decode an image using a ZXing-first cascade over original and SR/upscale variants."""
 
     cfg = config or DecodeConfig()
-    source = _normalize_image(image)
+    source = _normalize_image(image, input_color=cfg.input_color)
     backends = _normalize_backends(cfg.backends)
     started = time.perf_counter()
     attempts: list[DecodeAttempt] = []
@@ -226,8 +231,12 @@ def _normalize_backends(backends: tuple[str, ...]) -> tuple[str, ...]:
             backend = ZXING_BACKEND
         elif key in {"wechat", "wechat-qr", "wechat-qrcode"}:
             backend = WECHAT_BACKEND
+        elif key in {"pyzbar", "zbar"}:
+            backend = PYZBAR_BACKEND
+        elif key in {"opencv", "opencv-qr", "cv2"}:
+            backend = OPENCV_QR_BACKEND
         else:
-            raise ValueError("backends must contain only: zxing, wechat")
+            raise ValueError("backends must contain only: zxing, wechat, pyzbar, opencv_qr")
         if backend not in normalized:
             normalized.append(backend)
     if not normalized:
@@ -251,6 +260,16 @@ def _decode_backend(
         if detector is None:
             return None
         return _decode_wechat_qr(image, detector, scale=scale)
+    if backend == PYZBAR_BACKEND:
+        decode = _get_pyzbar_decode(backend_state, notes)
+        if decode is None:
+            return None
+        return _decode_pyzbar(image, decode, scale=scale)
+    if backend == OPENCV_QR_BACKEND:
+        detector = _get_opencv_qr_detector(backend_state, notes)
+        if detector is None:
+            return None
+        return _decode_opencv_qr(image, detector, scale=scale)
     raise AssertionError(f"unexpected backend: {backend}")
 
 
@@ -271,11 +290,11 @@ def _decode_zxing(image: np.ndarray, cfg: DecodeConfig, *, scale: float) -> list
 def _get_wechat_detector(backend_state: dict[str, Any], notes: list[str]) -> Any | None:
     if "wechat_detector" in backend_state:
         detector = backend_state["wechat_detector"]
-        return None if detector is _WECHAT_UNAVAILABLE else detector
+        return None if detector is _UNAVAILABLE else detector
 
     constructor = getattr(cv2, "wechat_qrcode_WeChatQRCode", None)
     if constructor is None:
-        backend_state["wechat_detector"] = _WECHAT_UNAVAILABLE
+        backend_state["wechat_detector"] = _UNAVAILABLE
         notes.append(
             "WeChat QR fallback unavailable: cv2 has no wechat_qrcode_WeChatQRCode. "
             "Install opencv-contrib-python to enable the CNN/SR fallback."
@@ -285,7 +304,11 @@ def _get_wechat_detector(backend_state: dict[str, Any], notes: list[str]) -> Any
     try:
         detector = constructor()
     except Exception as exc:  # pragma: no cover - depends on OpenCV build/model packaging
-        backend_state["wechat_detector"] = _WECHAT_UNAVAILABLE
+        backend_state["wechat_detector"] = _UNAVAILABLE
+        logger.warning(
+            "OpenCV WeChat QR decoder failed to initialize; continuing without it: %s",
+            exc,
+        )
         notes.append(f"WeChat QR fallback unavailable: {exc}")
         return None
 
@@ -297,6 +320,9 @@ def _decode_wechat_qr(image: np.ndarray, detector: Any, *, scale: float) -> list
     if image.ndim == 2:
         detector_input = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     else:
+        # Ported from pricetag_vision.core.qr: WeChat's CNN/SR path expects BGR.
+        # decode_image(..., input_color="rgb") converts caller RGB crops to BGR
+        # before variants are generated, so all internal 3-channel images are BGR.
         detector_input = image
 
     texts, points = _unpack_wechat_result(detector.detectAndDecode(detector_input))
@@ -320,6 +346,88 @@ def _decode_wechat_qr(image: np.ndarray, detector: Any, *, scale: float) -> list
             )
         )
     return barcodes
+
+
+def _get_pyzbar_decode(backend_state: dict[str, Any], notes: list[str]) -> Any | None:
+    if "pyzbar_decode" in backend_state:
+        decode = backend_state["pyzbar_decode"]
+        return None if decode is _UNAVAILABLE else decode
+
+    try:
+        from pyzbar.pyzbar import decode
+    except ImportError:
+        backend_state["pyzbar_decode"] = _UNAVAILABLE
+        notes.append("pyzbar fallback unavailable: install pyzbar and libzbar to enable it.")
+        return None
+
+    backend_state["pyzbar_decode"] = decode
+    return decode
+
+
+def _decode_pyzbar(image: np.ndarray, decode: Any, *, scale: float) -> list[DecodedBarcode]:
+    decoded = decode(image)
+    barcodes: list[DecodedBarcode] = []
+    for item in decoded:
+        raw_bytes = bytes(getattr(item, "data", b"") or b"")
+        text = raw_bytes.decode("utf-8", errors="replace")
+        symbology = str(getattr(item, "type", "") or "")
+        if not text:
+            continue
+        barcodes.append(
+            DecodedBarcode(
+                backend=PYZBAR_BACKEND,
+                text=text,
+                bytes_hex=raw_bytes.hex(),
+                format=symbology,
+                symbology=symbology,
+                symbology_identifier="",
+                valid=True,
+                error=None,
+                position=_pyzbar_polygon_to_tuple(getattr(item, "polygon", None), scale=scale),
+                extra={"detector": "pyzbar"},
+            )
+        )
+    return barcodes
+
+
+def _get_opencv_qr_detector(backend_state: dict[str, Any], notes: list[str]) -> Any | None:
+    if "opencv_qr_detector" in backend_state:
+        detector = backend_state["opencv_qr_detector"]
+        return None if detector is _UNAVAILABLE else detector
+
+    try:
+        detector = cv2.QRCodeDetector()
+    except Exception as exc:  # pragma: no cover - depends on OpenCV build
+        backend_state["opencv_qr_detector"] = _UNAVAILABLE
+        notes.append(f"OpenCV QR fallback unavailable: {exc}")
+        return None
+
+    backend_state["opencv_qr_detector"] = detector
+    return detector
+
+
+def _decode_opencv_qr(image: np.ndarray, detector: Any, *, scale: float) -> list[DecodedBarcode]:
+    try:
+        data, points, _straight = detector.detectAndDecode(image)
+    except ValueError:
+        data, points = "", None
+    if not data:
+        return []
+    text = str(data)
+    return [
+        DecodedBarcode(
+            backend=OPENCV_QR_BACKEND,
+            text=text,
+            bytes_hex=text.encode("utf-8", "replace").hex(),
+            format="QRCode",
+            symbology="QRCODE",
+            symbology_identifier="",
+            valid=True,
+            error=None,
+            position=_opencv_points_to_tuple(points, index=0, scale=scale),
+            extra={"detector": "cv2.QRCodeDetector"},
+        )
+    ]
 
 
 def _unpack_wechat_result(result: Any) -> tuple[tuple[Any, ...], Any]:
@@ -363,6 +471,23 @@ def _opencv_points_to_tuple(
     if len(flat_quad) < 4:
         return None
     return tuple((float(x) / scale, float(y) / scale) for x, y in flat_quad[:4])
+
+
+def _pyzbar_polygon_to_tuple(
+    polygon: Any,
+    *,
+    scale: float,
+) -> tuple[tuple[float, float], ...] | None:
+    if polygon is None:
+        return None
+    points: list[tuple[float, float]] = []
+    for point in polygon:
+        x = getattr(point, "x", None)
+        y = getattr(point, "y", None)
+        if x is None or y is None:
+            return None
+        points.append((float(x) / scale, float(y) / scale))
+    return tuple(points) if points else None
 
 
 def _resolve_formats(zxingcpp: Any, formats: str) -> Any:
@@ -461,23 +586,34 @@ def _iter_variants(
             if cfg.enable_sharpen:
                 yield (f"{base_name}-sharpen", scale, _sharpen(resized))
         if sr_model is not None:
-            modeled = _normalize_image(sr_model(image, scale))
+            modeled = _normalize_image(sr_model(image, scale), input_color="bgr")
             yield (f"model-x{scale:g}", scale, modeled)
 
 
-def _normalize_image(image: np.ndarray) -> np.ndarray:
+def _normalize_image(image: np.ndarray, *, input_color: str = "bgr") -> np.ndarray:
+    color = _normalize_input_color(input_color)
     array = np.asarray(image)
     if array.dtype != np.uint8:
         raise TypeError(f"image dtype must be uint8, got {array.dtype}")
     if array.ndim == 2:
         return np.ascontiguousarray(array)
     if array.ndim != 3:
-        raise ValueError("image must be grayscale, BGR, or BGRA")
+        raise ValueError("image must be grayscale, BGR/RGB, or BGRA/RGBA")
     if array.shape[2] == 3:
+        if color == "rgb":
+            return np.ascontiguousarray(cv2.cvtColor(array, cv2.COLOR_RGB2BGR))
         return np.ascontiguousarray(array)
     if array.shape[2] == 4:
-        return np.ascontiguousarray(cv2.cvtColor(array, cv2.COLOR_BGRA2BGR))
-    raise ValueError("image must be grayscale, BGR, or BGRA")
+        code = cv2.COLOR_RGBA2BGR if color == "rgb" else cv2.COLOR_BGRA2BGR
+        return np.ascontiguousarray(cv2.cvtColor(array, code))
+    raise ValueError("image must be grayscale, BGR/RGB, or BGRA/RGBA")
+
+
+def _normalize_input_color(value: str) -> str:
+    color = str(value).strip().lower()
+    if color not in {"bgr", "rgb"}:
+        raise ValueError("input_color must be one of: bgr, rgb")
+    return color
 
 
 def _resize(image: np.ndarray, scale: float, interpolation: str) -> np.ndarray:
@@ -521,7 +657,7 @@ def _parse_csv_strings(value: str) -> tuple[str, ...]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Decode QR/barcodes with zxing-cpp + SR retries.")
+    parser = argparse.ArgumentParser(description="Decode QR/barcodes with a cascade + SR retries.")
     parser.add_argument("image", type=Path, help="image to decode")
     parser.add_argument("--json", action="store_true", help="print full JSON diagnostics")
     parser.add_argument(
@@ -534,7 +670,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backends",
         default="zxing,wechat",
-        help="comma-separated decoder backends; order is preserved (zxing,wechat)",
+        help="comma-separated decoder backends; supported: zxing,wechat,pyzbar,opencv_qr",
+    )
+    parser.add_argument(
+        "--input-color",
+        choices=("bgr", "rgb"),
+        default="bgr",
+        help="channel order for 3/4-channel input arrays; CLI files are read as bgr",
     )
     parser.add_argument(
         "--interpolations",
@@ -557,6 +699,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     cfg = DecodeConfig(
         backends=_parse_csv_strings(args.backends),
+        input_color=args.input_color,
         formats=args.formats,
         scale_factors=_parse_csv_floats(args.scales),
         interpolations=_parse_csv_strings(args.interpolations),
