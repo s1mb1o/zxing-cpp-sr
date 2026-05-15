@@ -14,6 +14,31 @@ available. The package-level variants are OpenCV-based bicubic/Lanczos upscales
 plus optional CLAHE and sharpening. A caller can pass a model hook if a trained
 SR network becomes available.
 
+## Pipeline
+
+```mermaid
+flowchart TD
+    A["Image file or ndarray"] --> B["Normalize dtype and channel order"]
+    B --> C["Variant iterator"]
+    C --> D["Original image"]
+    C --> E["Upscale / CLAHE / sharpen variants"]
+    C --> F["Optional model SR variant"]
+    D --> G["Ordered decoder cascade"]
+    E --> G
+    F --> G
+    G --> H["ZXing-C++"]
+    H -->|valid payload| R["DecodeResult success"]
+    H -->|miss| I["WeChat QR"]
+    I -->|valid payload| R
+    I -->|miss| J["Optional pyzbar"]
+    J -->|valid payload| R
+    J -->|miss| K["Optional OpenCV QR"]
+    K -->|valid payload| R
+    K -->|miss| L["Next variant"]
+    L --> C
+    C -->|no variants left| M["DecodeResult failure with diagnostics"]
+```
+
 ## Quickstart
 
 ```bash
@@ -101,10 +126,11 @@ partial-content or checksum-error cases.
 
 Measured QR parsing speed and recall notes live in
 [docs/benchmark_results.md](docs/benchmark_results.md). Current result:
-`original_only` gets all decodes that the SR retry stack gets on the local Lenta
-fixtures, while staying in the sub-millisecond to low-single-digit millisecond
-range for crop-sized inputs. The full retry stack is useful for offline failure
-analysis, not the hot path, unless a target crop family proves otherwise.
+`original_only` gets all decodes that the SR retry stack gets on the local
+fixture sets, while staying in the sub-millisecond to low-single-digit
+millisecond range for crop-sized inputs. The full retry stack is useful for
+offline failure analysis, not the hot path, unless a target crop family proves
+otherwise.
 
 ## Scope
 
@@ -122,7 +148,7 @@ In:
 Out:
 
 - Detection in full video frames.
-- Reed-Solomon override or Lenta-specific QR recovery.
+- Reed-Solomon override or domain-specific QR recovery.
 - Generic image restoration. Learned SR should be passed as a hook and measured
   separately.
 

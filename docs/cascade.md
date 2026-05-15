@@ -15,6 +15,19 @@ Default:
 DecodeConfig(backends=("zxing", "wechat"))
 ```
 
+```mermaid
+flowchart LR
+    V["One prepared variant"] --> Z["ZXing-C++"]
+    Z -->|payload accepted| S["Stop and return success"]
+    Z -->|miss or rejected candidate| W["WeChat QR"]
+    W -->|payload accepted| S
+    W -->|miss| P["pyzbar (optional)"]
+    P -->|payload accepted| S
+    P -->|miss| O["OpenCV QR (optional)"]
+    O -->|payload accepted| S
+    O -->|miss| N["Try next variant"]
+```
+
 This means:
 
 1. Try ZXing-C++ first.
@@ -44,8 +57,70 @@ Fallback backends are initialized only when reached. A successful ZXing decode
 does not construct WeChat, pyzbar, OpenCV QR, SR model variants, or later
 upscale variants.
 
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Decoder
+    participant Variants
+    participant ZXing
+    participant WeChat
+    participant Optional
+
+    Client->>Decoder: decode_image(image, config)
+    Decoder->>Variants: request original variant
+    Variants-->>Decoder: original
+    Decoder->>ZXing: decode original
+    alt ZXing succeeds
+        ZXing-->>Decoder: payload
+        Decoder-->>Client: success with one attempt
+    else ZXing misses
+        Decoder->>WeChat: lazy init and decode
+        alt WeChat succeeds
+            WeChat-->>Decoder: payload
+            Decoder-->>Client: success with two attempts
+        else WeChat misses
+            Decoder->>Optional: run later configured backends
+            Optional-->>Decoder: no payload
+            Decoder->>Variants: request next variant
+        end
+    end
+```
+
 This mirrors the first-success behavior from `_DecoderChain` while preserving
 the richer `DecodeAttempt` diagnostics used by this package.
+
+## Variant Loop
+
+```mermaid
+flowchart TD
+    A["Input image"] --> B{"try_original_first?"}
+    B -->|yes| C["Yield original"]
+    B -->|no| D["Scale factors"]
+    C --> E["Run decoder cascade"]
+    E -->|success| S["Return DecodeResult"]
+    E -->|miss| D
+    D --> F["Resize with configured interpolation"]
+    F --> G["Run decoder cascade"]
+    G -->|success| S
+    G -->|miss| H{"CLAHE enabled?"}
+    H -->|yes| I["Apply CLAHE"]
+    I --> J["Run decoder cascade"]
+    H -->|no| K{"Sharpen enabled?"}
+    J -->|success| S
+    J -->|miss| K
+    K -->|yes| L["Apply sharpen"]
+    L --> M["Run decoder cascade"]
+    K -->|no| N{"SR model hook provided?"}
+    M -->|success| S
+    M -->|miss| N
+    N -->|yes| O["Run model SR hook"]
+    O --> P["Run decoder cascade"]
+    P -->|success| S
+    P -->|miss| Q{"more scales?"}
+    N -->|no| Q
+    Q -->|yes| D
+    Q -->|no| R["Return failure with attempts and notes"]
+```
 
 ## WeChat QR Channel Order
 

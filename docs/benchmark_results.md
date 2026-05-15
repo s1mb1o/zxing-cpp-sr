@@ -39,23 +39,23 @@ miss on the current variant. The standalone package also ports the optional
 main-repo fallbacks `pyzbar` and `opencv_qr`; they were not included in these
 timings.
 
-## Real Lenta Sets
+## Real Fixture Sets
 
 ### Summary
 
 | Set | Config | Success | Mean ms | Median ms | P95 ms | Mean attempts |
 |---|---:|---:|---:|---:|---:|---:|
-| `docs/qr_barcode/lenta_failures/*.png` | `original_only` | 2 / 8 (25.0%) | 0.218 | 0.204 | 0.384 | 1.00 |
-| `docs/qr_barcode/lenta_failures/*.png` | `default_sr_retry` | 2 / 8 (25.0%) | 40.178 | 32.099 | 143.943 | 14.50 |
-| `docs/qr_barcode/lenta_failures/*.png` | `x2_nearest_only` | 2 / 8 (25.0%) | 0.686 | 0.669 | 1.146 | 1.75 |
-| `data/external/variants/rectified/*.jpg` | `original_only` | 8 / 17 (47.1%) | 2.389 | 2.057 | 3.964 | 1.00 |
-| `data/external/variants/rectified/*.jpg` | `default_sr_retry` | 8 / 17 (47.1%) | 281.051 | 235.292 | 936.807 | 10.53 |
-| `data/external/variants/rectified/*.jpg` | `x2_nearest_only` | 8 / 17 (47.1%) | 6.719 | 4.944 | 19.210 | 1.53 |
+| `fixture_a/*.png` | `original_only` | 2 / 8 (25.0%) | 0.218 | 0.204 | 0.384 | 1.00 |
+| `fixture_a/*.png` | `default_sr_retry` | 2 / 8 (25.0%) | 40.178 | 32.099 | 143.943 | 14.50 |
+| `fixture_a/*.png` | `x2_nearest_only` | 2 / 8 (25.0%) | 0.686 | 0.669 | 1.146 | 1.75 |
+| `fixture_b/*.jpg` | `original_only` | 8 / 17 (47.1%) | 2.389 | 2.057 | 3.964 | 1.00 |
+| `fixture_b/*.jpg` | `default_sr_retry` | 8 / 17 (47.1%) | 281.051 | 235.292 | 936.807 | 10.53 |
+| `fixture_b/*.jpg` | `x2_nearest_only` | 8 / 17 (47.1%) | 6.719 | 4.944 | 19.210 | 1.53 |
 
 ### Interpretation
 
 - The SR/upscale retries produced **zero net-new decodes** on these two real
-  Lenta sets. This matches the existing QR-recovery diagnosis: the `fail_*`
+  fixture sets. This matches the existing QR-recovery diagnosis: the `fail_*`
   samples are dominated by missing modules, clipped finders, or print damage,
   not by simple undersampling.
 - `original_only` is the right production default when the crop is already a
@@ -68,12 +68,12 @@ timings.
 
 ### Successful Real Files
 
-`docs/qr_barcode/lenta_failures/*.png` successful files:
+`fixture_a/*.png` successful files:
 
 - `ok_PXL_20260420_123511023__b0.png`
 - `ok_PXL_20260420_123552804__b1.png`
 
-`data/external/variants/rectified/*.jpg` successful files:
+`fixture_b/*.jpg` successful files:
 
 - `PXL_20260420_123511023__b0.jpg`
 - `PXL_20260420_123540194__b0.jpg`
@@ -119,7 +119,7 @@ decodes. Times are wall-clock milliseconds per decode.
 Use a two-tier policy:
 
 1. Run `original_only` first in production. It is fast and gets all decodable
-   cases in the current Lenta fixtures.
+   cases in the current fixtures.
 2. Escalate to the WeChat QR fallback after a ZXing miss when QR recall matters
    more than worst-case latency. It can be enabled with
    `DecodeConfig(backends=("zxing", "wechat"))` or `--backends zxing,wechat`.
