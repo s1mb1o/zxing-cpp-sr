@@ -1,4 +1,4 @@
-"""ZXing-C++ decoder wrapper with deterministic upscale/SR retries."""
+"""ZXing-first QR/barcode decoder with WeChat fallback and SR retries."""
 
 from zxing_cpp_sr.decoder import (
     DecodeAttempt,

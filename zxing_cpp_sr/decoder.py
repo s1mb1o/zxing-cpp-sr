@@ -6,21 +6,25 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterator
 from typing import Any, Callable
 
 import cv2
 import numpy as np
 
 SRModel = Callable[[np.ndarray, float], np.ndarray]
+ZXING_BACKEND = "zxing-cpp"
+WECHAT_BACKEND = "wechat_qrcode"
+_WECHAT_UNAVAILABLE = object()
 
 
 @dataclass(frozen=True)
 class DecodedBarcode:
-    """A normalized ZXing barcode result."""
+    """A normalized barcode result from one decoder backend."""
 
+    backend: str
     text: str
     bytes_hex: str
     format: str
@@ -33,6 +37,7 @@ class DecodedBarcode:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "backend": self.backend,
             "text": self.text,
             "bytes_hex": self.bytes_hex,
             "format": self.format,
@@ -47,8 +52,9 @@ class DecodedBarcode:
 
 @dataclass(frozen=True)
 class DecodeAttempt:
-    """One preprocessing variant and the ZXing result on that image."""
+    """One decoder backend pass on one preprocessing variant."""
 
+    backend: str
     variant: str
     scale: float
     width: int
@@ -63,6 +69,7 @@ class DecodeAttempt:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "backend": self.backend,
             "variant": self.variant,
             "scale": self.scale,
             "width": self.width,
@@ -91,7 +98,7 @@ class DecodeResult:
         return {
             "success": self.success,
             "payload": self.payload,
-            "backend": "zxing-cpp",
+            "backend": self.barcode.backend if self.barcode is not None else None,
             "variant": self.variant,
             "scale": self.scale,
             "barcode": self.barcode.to_dict() if self.barcode is not None else None,
@@ -103,8 +110,9 @@ class DecodeResult:
 
 @dataclass(frozen=True)
 class DecodeConfig:
-    """Controls ZXing and preprocessing retries."""
+    """Controls decoder backends and preprocessing retries."""
 
+    backends: tuple[str, ...] = ("zxing", "wechat")
     formats: str = "qr"  # qr, retail, all
     scale_factors: tuple[float, ...] = (2.0, 3.0, 4.0)
     interpolations: tuple[str, ...] = ("cubic", "lanczos")
@@ -138,52 +146,66 @@ def decode_image(
     *,
     sr_model: SRModel | None = None,
 ) -> DecodeResult:
-    """Decode an image using ZXing-C++ over original and SR/upscale variants."""
+    """Decode an image using a ZXing-first cascade over original and SR/upscale variants."""
 
     cfg = config or DecodeConfig()
     source = _normalize_image(image)
+    backends = _normalize_backends(cfg.backends)
     started = time.perf_counter()
     attempts: list[DecodeAttempt] = []
     notes: list[str] = []
+    backend_state: dict[str, Any] = {}
 
     for variant_name, scale, variant in _iter_variants(source, cfg, sr_model=sr_model):
-        attempt_started = time.perf_counter()
-        try:
-            barcodes = tuple(_decode_zxing(variant, cfg, scale=scale))
-            error = None
-        except Exception as exc:  # pragma: no cover - environment-dependent binding failures
-            barcodes = ()
-            error = str(exc)
-        elapsed_ms = (time.perf_counter() - attempt_started) * 1000.0
-        height, width = variant.shape[:2]
-        attempt = DecodeAttempt(
-            variant=variant_name,
-            scale=scale,
-            width=width,
-            height=height,
-            elapsed_ms=elapsed_ms,
-            barcodes=barcodes,
-            error=error,
-        )
-        attempts.append(attempt)
-
-        winner = _pick_success(barcodes, accept_checksum_errors=cfg.accept_checksum_errors)
-        if winner is not None:
-            total_ms = (time.perf_counter() - started) * 1000.0
-            return DecodeResult(
-                success=True,
-                payload=winner.text,
+        for backend in backends:
+            attempt_started = time.perf_counter()
+            try:
+                decoded = _decode_backend(
+                    backend,
+                    variant,
+                    cfg,
+                    scale=scale,
+                    backend_state=backend_state,
+                    notes=notes,
+                )
+                if decoded is None:
+                    continue
+                barcodes = tuple(decoded)
+                error = None
+            except Exception as exc:  # pragma: no cover - environment-dependent binding failures
+                barcodes = ()
+                error = str(exc)
+            elapsed_ms = (time.perf_counter() - attempt_started) * 1000.0
+            height, width = variant.shape[:2]
+            attempt = DecodeAttempt(
+                backend=backend,
                 variant=variant_name,
                 scale=scale,
-                barcode=winner,
-                attempts=tuple(attempts),
-                elapsed_ms=total_ms,
-                notes=tuple(notes),
+                width=width,
+                height=height,
+                elapsed_ms=elapsed_ms,
+                barcodes=barcodes,
+                error=error,
             )
+            attempts.append(attempt)
+
+            winner = _pick_success(barcodes, accept_checksum_errors=cfg.accept_checksum_errors)
+            if winner is not None:
+                total_ms = (time.perf_counter() - started) * 1000.0
+                return DecodeResult(
+                    success=True,
+                    payload=winner.text,
+                    variant=variant_name,
+                    scale=scale,
+                    barcode=winner,
+                    attempts=tuple(attempts),
+                    elapsed_ms=total_ms,
+                    notes=tuple(notes),
+                )
 
     total_ms = (time.perf_counter() - started) * 1000.0
     if any(item.barcodes for item in attempts):
-        notes.append("ZXing returned barcode candidates, but none were accepted as valid payloads.")
+        notes.append("Decoder candidates were returned, but none were accepted as valid payloads.")
     return DecodeResult(
         success=False,
         payload=None,
@@ -194,6 +216,42 @@ def decode_image(
         elapsed_ms=total_ms,
         notes=tuple(notes),
     )
+
+
+def _normalize_backends(backends: tuple[str, ...]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in backends:
+        key = value.strip().lower().replace("_", "-")
+        if key in {"zxing", "zxing-cpp", "zxingcpp"}:
+            backend = ZXING_BACKEND
+        elif key in {"wechat", "wechat-qr", "wechat-qrcode"}:
+            backend = WECHAT_BACKEND
+        else:
+            raise ValueError("backends must contain only: zxing, wechat")
+        if backend not in normalized:
+            normalized.append(backend)
+    if not normalized:
+        raise ValueError("at least one backend is required")
+    return tuple(normalized)
+
+
+def _decode_backend(
+    backend: str,
+    image: np.ndarray,
+    cfg: DecodeConfig,
+    *,
+    scale: float,
+    backend_state: dict[str, Any],
+    notes: list[str],
+) -> list[DecodedBarcode] | None:
+    if backend == ZXING_BACKEND:
+        return _decode_zxing(image, cfg, scale=scale)
+    if backend == WECHAT_BACKEND:
+        detector = _get_wechat_detector(backend_state, notes)
+        if detector is None:
+            return None
+        return _decode_wechat_qr(image, detector, scale=scale)
+    raise AssertionError(f"unexpected backend: {backend}")
 
 
 def _decode_zxing(image: np.ndarray, cfg: DecodeConfig, *, scale: float) -> list[DecodedBarcode]:
@@ -208,6 +266,103 @@ def _decode_zxing(image: np.ndarray, cfg: DecodeConfig, *, scale: float) -> list
         return_errors=cfg.return_errors,
     )
     return [_normalize_barcode(item, scale=scale) for item in results]
+
+
+def _get_wechat_detector(backend_state: dict[str, Any], notes: list[str]) -> Any | None:
+    if "wechat_detector" in backend_state:
+        detector = backend_state["wechat_detector"]
+        return None if detector is _WECHAT_UNAVAILABLE else detector
+
+    constructor = getattr(cv2, "wechat_qrcode_WeChatQRCode", None)
+    if constructor is None:
+        backend_state["wechat_detector"] = _WECHAT_UNAVAILABLE
+        notes.append(
+            "WeChat QR fallback unavailable: cv2 has no wechat_qrcode_WeChatQRCode. "
+            "Install opencv-contrib-python to enable the CNN/SR fallback."
+        )
+        return None
+
+    try:
+        detector = constructor()
+    except Exception as exc:  # pragma: no cover - depends on OpenCV build/model packaging
+        backend_state["wechat_detector"] = _WECHAT_UNAVAILABLE
+        notes.append(f"WeChat QR fallback unavailable: {exc}")
+        return None
+
+    backend_state["wechat_detector"] = detector
+    return detector
+
+
+def _decode_wechat_qr(image: np.ndarray, detector: Any, *, scale: float) -> list[DecodedBarcode]:
+    if image.ndim == 2:
+        detector_input = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    else:
+        detector_input = image
+
+    texts, points = _unpack_wechat_result(detector.detectAndDecode(detector_input))
+    barcodes: list[DecodedBarcode] = []
+    for index, raw_text in enumerate(texts):
+        text = str(raw_text or "")
+        if not text:
+            continue
+        barcodes.append(
+            DecodedBarcode(
+                backend=WECHAT_BACKEND,
+                text=text,
+                bytes_hex=text.encode("utf-8", "replace").hex(),
+                format="QRCode",
+                symbology="QR Code",
+                symbology_identifier="",
+                valid=True,
+                error=None,
+                position=_opencv_points_to_tuple(points, index=index, scale=scale),
+                extra={"detector": "cv2.wechat_qrcode_WeChatQRCode"},
+            )
+        )
+    return barcodes
+
+
+def _unpack_wechat_result(result: Any) -> tuple[tuple[Any, ...], Any]:
+    if isinstance(result, tuple):
+        payloads = result[0] if result else ()
+        points = result[1] if len(result) > 1 else None
+    else:
+        payloads = result
+        points = None
+
+    if payloads is None:
+        texts: tuple[Any, ...] = ()
+    elif isinstance(payloads, str):
+        texts = (payloads,)
+    else:
+        texts = tuple(payloads)
+    return texts, points
+
+
+def _opencv_points_to_tuple(
+    points: Any,
+    *,
+    index: int,
+    scale: float,
+) -> tuple[tuple[float, float], ...] | None:
+    if points is None:
+        return None
+    array = np.asarray(points, dtype=np.float32)
+    if array.size == 0:
+        return None
+    array = np.squeeze(array)
+    if array.ndim == 3:
+        if index >= array.shape[0]:
+            return None
+        quad = array[index]
+    elif array.ndim == 2:
+        quad = array
+    else:
+        return None
+    flat_quad = np.asarray(quad, dtype=np.float32).reshape(-1, 2)
+    if len(flat_quad) < 4:
+        return None
+    return tuple((float(x) / scale, float(y) / scale) for x, y in flat_quad[:4])
 
 
 def _resolve_formats(zxingcpp: Any, formats: str) -> Any:
@@ -234,6 +389,7 @@ def _normalize_barcode(item: Any, *, scale: float) -> DecodedBarcode:
     else:
         bytes_hex = bytes(raw_bytes).hex()
     return DecodedBarcode(
+        backend=ZXING_BACKEND,
         text=str(getattr(item, "text", "") or ""),
         bytes_hex=bytes_hex,
         format=str(getattr(item, "format", "")),
@@ -376,6 +532,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scales", default="2,3,4", help="comma-separated SR/upscale factors")
     parser.add_argument(
+        "--backends",
+        default="zxing,wechat",
+        help="comma-separated decoder backends; order is preserved (zxing,wechat)",
+    )
+    parser.add_argument(
         "--interpolations",
         default="cubic,lanczos",
         help="comma-separated OpenCV resize methods",
@@ -395,6 +556,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     cfg = DecodeConfig(
+        backends=_parse_csv_strings(args.backends),
         formats=args.formats,
         scale_factors=_parse_csv_floats(args.scales),
         interpolations=_parse_csv_strings(args.interpolations),
@@ -409,7 +571,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
     elif result.success:
         print(f"OK payload={result.payload!r}")
-        print(f"   variant={result.variant} scale={result.scale} attempts={len(result.attempts)}")
+        print(
+            f"   backend={result.barcode.backend if result.barcode else None} "
+            f"variant={result.variant} scale={result.scale} attempts={len(result.attempts)}"
+        )
         print(f"   elapsed={result.elapsed_ms:.1f} ms")
     else:
         print(f"FAIL attempts={len(result.attempts)} elapsed={result.elapsed_ms:.1f} ms")
