@@ -1,0 +1,422 @@
+"""ZXing-C++ decode wrapper with deterministic classical SR variants."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from collections.abc import Iterator
+from typing import Any, Callable
+
+import cv2
+import numpy as np
+
+SRModel = Callable[[np.ndarray, float], np.ndarray]
+
+
+@dataclass(frozen=True)
+class DecodedBarcode:
+    """A normalized ZXing barcode result."""
+
+    text: str
+    bytes_hex: str
+    format: str
+    symbology: str
+    symbology_identifier: str
+    valid: bool
+    error: str | None
+    position: tuple[tuple[float, float], ...] | None
+    extra: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "text": self.text,
+            "bytes_hex": self.bytes_hex,
+            "format": self.format,
+            "symbology": self.symbology,
+            "symbology_identifier": self.symbology_identifier,
+            "valid": self.valid,
+            "error": self.error,
+            "position": self.position,
+            "extra": self.extra,
+        }
+
+
+@dataclass(frozen=True)
+class DecodeAttempt:
+    """One preprocessing variant and the ZXing result on that image."""
+
+    variant: str
+    scale: float
+    width: int
+    height: int
+    elapsed_ms: float
+    barcodes: tuple[DecodedBarcode, ...]
+    error: str | None = None
+
+    @property
+    def decoded(self) -> bool:
+        return any(item.text and item.valid for item in self.barcodes)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "variant": self.variant,
+            "scale": self.scale,
+            "width": self.width,
+            "height": self.height,
+            "elapsed_ms": self.elapsed_ms,
+            "decoded": self.decoded,
+            "barcodes": [item.to_dict() for item in self.barcodes],
+            "error": self.error,
+        }
+
+
+@dataclass(frozen=True)
+class DecodeResult:
+    """Full decode result, including every attempted variant."""
+
+    success: bool
+    payload: str | None
+    variant: str | None
+    scale: float | None
+    barcode: DecodedBarcode | None
+    attempts: tuple[DecodeAttempt, ...]
+    elapsed_ms: float
+    notes: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "payload": self.payload,
+            "backend": "zxing-cpp",
+            "variant": self.variant,
+            "scale": self.scale,
+            "barcode": self.barcode.to_dict() if self.barcode is not None else None,
+            "attempts": [attempt.to_dict() for attempt in self.attempts],
+            "elapsed_ms": self.elapsed_ms,
+            "notes": list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
+class DecodeConfig:
+    """Controls ZXing and preprocessing retries."""
+
+    formats: str = "qr"  # qr, retail, all
+    scale_factors: tuple[float, ...] = (2.0, 3.0, 4.0)
+    interpolations: tuple[str, ...] = ("cubic", "lanczos")
+    try_original_first: bool = True
+    enable_clahe: bool = True
+    enable_sharpen: bool = True
+    try_rotate: bool = True
+    try_downscale: bool = True
+    try_invert: bool = True
+    return_errors: bool = True
+    accept_checksum_errors: bool = False
+
+
+def decode_file(
+    path: str | Path,
+    config: DecodeConfig | None = None,
+    *,
+    sr_model: SRModel | None = None,
+) -> DecodeResult:
+    """Decode an image file."""
+
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise FileNotFoundError(f"Failed to read image: {path}")
+    return decode_image(image, config=config, sr_model=sr_model)
+
+
+def decode_image(
+    image: np.ndarray,
+    config: DecodeConfig | None = None,
+    *,
+    sr_model: SRModel | None = None,
+) -> DecodeResult:
+    """Decode an image using ZXing-C++ over original and SR/upscale variants."""
+
+    cfg = config or DecodeConfig()
+    source = _normalize_image(image)
+    started = time.perf_counter()
+    attempts: list[DecodeAttempt] = []
+    notes: list[str] = []
+
+    for variant_name, scale, variant in _iter_variants(source, cfg, sr_model=sr_model):
+        attempt_started = time.perf_counter()
+        try:
+            barcodes = tuple(_decode_zxing(variant, cfg, scale=scale))
+            error = None
+        except Exception as exc:  # pragma: no cover - environment-dependent binding failures
+            barcodes = ()
+            error = str(exc)
+        elapsed_ms = (time.perf_counter() - attempt_started) * 1000.0
+        height, width = variant.shape[:2]
+        attempt = DecodeAttempt(
+            variant=variant_name,
+            scale=scale,
+            width=width,
+            height=height,
+            elapsed_ms=elapsed_ms,
+            barcodes=barcodes,
+            error=error,
+        )
+        attempts.append(attempt)
+
+        winner = _pick_success(barcodes, accept_checksum_errors=cfg.accept_checksum_errors)
+        if winner is not None:
+            total_ms = (time.perf_counter() - started) * 1000.0
+            return DecodeResult(
+                success=True,
+                payload=winner.text,
+                variant=variant_name,
+                scale=scale,
+                barcode=winner,
+                attempts=tuple(attempts),
+                elapsed_ms=total_ms,
+                notes=tuple(notes),
+            )
+
+    total_ms = (time.perf_counter() - started) * 1000.0
+    if any(item.barcodes for item in attempts):
+        notes.append("ZXing returned barcode candidates, but none were accepted as valid payloads.")
+    return DecodeResult(
+        success=False,
+        payload=None,
+        variant=None,
+        scale=None,
+        barcode=None,
+        attempts=tuple(attempts),
+        elapsed_ms=total_ms,
+        notes=tuple(notes),
+    )
+
+
+def _decode_zxing(image: np.ndarray, cfg: DecodeConfig, *, scale: float) -> list[DecodedBarcode]:
+    import zxingcpp
+
+    results = zxingcpp.read_barcodes(
+        image,
+        formats=_resolve_formats(zxingcpp, cfg.formats),
+        try_rotate=cfg.try_rotate,
+        try_downscale=cfg.try_downscale,
+        try_invert=cfg.try_invert,
+        return_errors=cfg.return_errors,
+    )
+    return [_normalize_barcode(item, scale=scale) for item in results]
+
+
+def _resolve_formats(zxingcpp: Any, formats: str) -> Any:
+    key = formats.strip().lower()
+    if key == "all":
+        return None
+    if key == "qr":
+        return zxingcpp.BarcodeFormat.QRCode
+    if key == "retail":
+        return [
+            zxingcpp.BarcodeFormat.QRCode,
+            zxingcpp.BarcodeFormat.EAN13,
+            zxingcpp.BarcodeFormat.EAN8,
+            zxingcpp.BarcodeFormat.UPCA,
+            zxingcpp.BarcodeFormat.UPCE,
+        ]
+    raise ValueError("formats must be one of: qr, retail, all")
+
+
+def _normalize_barcode(item: Any, *, scale: float) -> DecodedBarcode:
+    raw_bytes = getattr(item, "bytes", b"") or b""
+    if isinstance(raw_bytes, str):
+        bytes_hex = raw_bytes.encode("utf-8", "replace").hex()
+    else:
+        bytes_hex = bytes(raw_bytes).hex()
+    return DecodedBarcode(
+        text=str(getattr(item, "text", "") or ""),
+        bytes_hex=bytes_hex,
+        format=str(getattr(item, "format", "")),
+        symbology=str(getattr(item, "symbology", "")),
+        symbology_identifier=str(getattr(item, "symbology_identifier", "")),
+        valid=bool(getattr(item, "valid", False)),
+        error=_error_to_str(getattr(item, "error", None)),
+        position=_position_to_tuple(getattr(item, "position", None), scale=scale),
+        extra=dict(getattr(item, "extra", {}) or {}),
+    )
+
+
+def _error_to_str(error: Any) -> str | None:
+    if error is None:
+        return None
+    return str(error)
+
+
+def _position_to_tuple(position: Any, *, scale: float) -> tuple[tuple[float, float], ...] | None:
+    if position is None:
+        return None
+    points = (
+        getattr(position, "top_left", None),
+        getattr(position, "top_right", None),
+        getattr(position, "bottom_right", None),
+        getattr(position, "bottom_left", None),
+    )
+    out: list[tuple[float, float]] = []
+    for point in points:
+        if point is None:
+            return None
+        out.append((float(point.x) / scale, float(point.y) / scale))
+    return tuple(out)
+
+
+def _pick_success(
+    barcodes: tuple[DecodedBarcode, ...],
+    *,
+    accept_checksum_errors: bool,
+) -> DecodedBarcode | None:
+    for barcode in barcodes:
+        if not barcode.text:
+            continue
+        if barcode.valid or accept_checksum_errors:
+            return barcode
+    return None
+
+
+def _iter_variants(
+    image: np.ndarray,
+    cfg: DecodeConfig,
+    *,
+    sr_model: SRModel | None,
+) -> Iterator[tuple[str, float, np.ndarray]]:
+    if cfg.try_original_first:
+        yield ("original", 1.0, image)
+
+    for scale in cfg.scale_factors:
+        if scale <= 0:
+            raise ValueError("scale factors must be positive")
+        if scale == 1.0 and cfg.try_original_first:
+            continue
+        for interpolation in cfg.interpolations:
+            resized = _resize(image, scale, interpolation)
+            base_name = f"{interpolation}-x{scale:g}"
+            yield (base_name, scale, resized)
+            if cfg.enable_clahe:
+                yield (f"{base_name}-clahe", scale, _apply_clahe(resized))
+            if cfg.enable_sharpen:
+                yield (f"{base_name}-sharpen", scale, _sharpen(resized))
+        if sr_model is not None:
+            modeled = _normalize_image(sr_model(image, scale))
+            yield (f"model-x{scale:g}", scale, modeled)
+
+
+def _normalize_image(image: np.ndarray) -> np.ndarray:
+    array = np.asarray(image)
+    if array.dtype != np.uint8:
+        raise TypeError(f"image dtype must be uint8, got {array.dtype}")
+    if array.ndim == 2:
+        return np.ascontiguousarray(array)
+    if array.ndim != 3:
+        raise ValueError("image must be grayscale, BGR, or BGRA")
+    if array.shape[2] == 3:
+        return np.ascontiguousarray(array)
+    if array.shape[2] == 4:
+        return np.ascontiguousarray(cv2.cvtColor(array, cv2.COLOR_BGRA2BGR))
+    raise ValueError("image must be grayscale, BGR, or BGRA")
+
+
+def _resize(image: np.ndarray, scale: float, interpolation: str) -> np.ndarray:
+    interp_table = {
+        "nearest": cv2.INTER_NEAREST,
+        "linear": cv2.INTER_LINEAR,
+        "cubic": cv2.INTER_CUBIC,
+        "lanczos": cv2.INTER_LANCZOS4,
+    }
+    if interpolation not in interp_table:
+        raise ValueError(f"unknown interpolation: {interpolation}")
+    height, width = image.shape[:2]
+    new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    return cv2.resize(image, new_size, interpolation=interp_table[interpolation])
+
+
+def _apply_clahe(image: np.ndarray) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    if image.ndim == 2:
+        return clahe.apply(image)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def _sharpen(image: np.ndarray) -> np.ndarray:
+    blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=1.0)
+    return cv2.addWeighted(image, 1.5, blurred, -0.5, 0.0)
+
+
+def _parse_csv_floats(value: str) -> tuple[float, ...]:
+    if not value.strip():
+        return ()
+    return tuple(float(part.strip()) for part in value.split(",") if part.strip())
+
+
+def _parse_csv_strings(value: str) -> tuple[str, ...]:
+    if not value.strip():
+        return ()
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Decode QR/barcodes with zxing-cpp + SR retries.")
+    parser.add_argument("image", type=Path, help="image to decode")
+    parser.add_argument("--json", action="store_true", help="print full JSON diagnostics")
+    parser.add_argument(
+        "--formats",
+        choices=("qr", "retail", "all"),
+        default="qr",
+        help="barcode formats to ask ZXing to decode",
+    )
+    parser.add_argument("--scales", default="2,3,4", help="comma-separated SR/upscale factors")
+    parser.add_argument(
+        "--interpolations",
+        default="cubic,lanczos",
+        help="comma-separated OpenCV resize methods",
+    )
+    parser.add_argument("--no-original", action="store_true", help="skip the original-image attempt")
+    parser.add_argument("--no-clahe", action="store_true", help="disable CLAHE variants")
+    parser.add_argument("--no-sharpen", action="store_true", help="disable sharpen variants")
+    parser.add_argument("--no-return-errors", action="store_true", help="do not ask ZXing for errors")
+    parser.add_argument(
+        "--accept-errors",
+        action="store_true",
+        help="accept non-valid ZXing results when text is present",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    cfg = DecodeConfig(
+        formats=args.formats,
+        scale_factors=_parse_csv_floats(args.scales),
+        interpolations=_parse_csv_strings(args.interpolations),
+        try_original_first=not args.no_original,
+        enable_clahe=not args.no_clahe,
+        enable_sharpen=not args.no_sharpen,
+        return_errors=not args.no_return_errors,
+        accept_checksum_errors=bool(args.accept_errors),
+    )
+    result = decode_file(args.image, cfg)
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    elif result.success:
+        print(f"OK payload={result.payload!r}")
+        print(f"   variant={result.variant} scale={result.scale} attempts={len(result.attempts)}")
+        print(f"   elapsed={result.elapsed_ms:.1f} ms")
+    else:
+        print(f"FAIL attempts={len(result.attempts)} elapsed={result.elapsed_ms:.1f} ms")
+        for note in result.notes:
+            print(f"   note: {note}")
+    return 0 if result.success else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
